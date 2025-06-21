@@ -1,0 +1,70 @@
+{
+    "type": "object",
+    "properties": {
+        "vika_api_token": {
+            "type": "string",
+            "title": "维格表 API Token",
+            "description": "从维格表用户中心获取的 API Token（必需）",
+            "default": ""
+        },
+        "vika_host": {
+            "type": "string",
+            "title": "维格表服务器地址",
+            "description": "维格表服务器的基础URL，默认为官方服务器。自建服务器请修改此配置",
+            "default": "https://api.vika.cn"
+        },
+        "default_space_id": {
+            "type": "string",
+            "title": "默认空间站 ID",
+            "description": "默认操作的空间站 ID（可选）。如果有多个空间站，设置此项可避免每次选择",
+            "default": ""
+        },
+        "auto_sync_on_startup": {
+            "type": "boolean",
+            "title": "启动时自动同步",
+            "description": "插件启动时自动同步数据表列表，无需手动触发",
+            "default": true
+        },
+        "datasheet_mapping": {
+            "type": "object",
+            "title": "数据表别名映射（手动配置）",
+            "description": "手动配置的数据表别名映射（可选）。推荐使用自动同步功能，此配置主要用于向后兼容",
+            "default": {},
+            "additionalProperties": {
+                "type": "string"
+            }
+        },
+        "custom_aliases": {
+            "type": "object",
+            "title": "自定义别名",
+            "description": "为数据表设置自定义别名，格式：{\"简短别名\": \"完整表名\"}。例如：{\"员工\": \"员工信息管理表\"}",
+            "default": {},
+            "additionalProperties": {
+                "type": "string"
+            }
+        },
+        "max_records_display": {
+            "type": "integer",
+            "title": "最大显示记录数",
+            "description": "单次查询返回的最大记录数量",
+            "default": 20,
+            "minimum": 1,
+            "maximum": 100
+        },
+        "enable_auto_type_conversion": {
+            "type": "boolean",
+            "title": "启用自动类型转换",
+            "description": "是否自动转换数据类型（数字、布尔值等）",
+            "default": true
+        },
+        "cache_duration_hours": {
+            "type": "integer",
+            "title": "缓存有效期（小时）",
+            "description": "数据表列表缓存的有效期，超时后将自动重新同步",
+            "default": 24,
+            "minimum": 1,
+            "maximum": 168
+        }
+    },
+    "required": ["vika_api_token", "vika_host"]
+}

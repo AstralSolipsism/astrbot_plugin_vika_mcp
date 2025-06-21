@@ -1,0 +1,6 @@
+name: "vika_mcp_plugin"
+display_name: "维格表MCP插件"
+description: "智能化维格表MCP插件，支持自动发现数据表，大模型通过自然语言自动调用各种操作功能"
+version: "0.9"
+author: "AstralSolipsism"
+repo: ""

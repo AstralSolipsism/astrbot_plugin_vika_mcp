@@ -1,0 +1,39 @@
+# AstrBot 维格表MCP插件配置示例 v3.0
+
+vika_mcp_plugin:
+  # 必需配置
+  vika_api_token: "ustk_your_api_token_here"     # 从维格表用户中心获取（必需）
+  vika_host: "https://api.vika.cn"               # 服务器地址（必需）
+  
+  # 智能化配置（推荐）
+  auto_sync_on_startup: true                     # 启动时自动同步数据表列表
+  default_space_id: "spc1234567890abcdef"        # 默认空间站ID（多空间站时推荐设置）
+  cache_duration_hours: 24                       # 缓存有效期（小时）
+  
+  # 自定义别名（可选）
+  custom_aliases:
+    "员工": "员工信息管理表"                     # 简短别名映射到完整表名
+    "项目": "项目管理跟踪表"
+    "客户": "客户关系管理表"
+    "产品": "产品信息库"
+    "订单": "订单管理系统"
+  
+  # 显示和性能配置
+  max_records_display: 20                        # 单次显示最大记录数（1-100）
+  enable_auto_type_conversion: true              # 启用自动类型转换
+  
+  # 向后兼容配置（可选，不推荐新用户使用）
+  datasheet_mapping:                             # 手动配置的数据表映射
+    "老系统表": "dst1234567890abcdef"            # 仅在无法自动同步时使用
+
+# 自建维格表服务器配置示例
+# vika_mcp_plugin:
+#   vika_api_token: "ustk_your_private_token"
+#   vika_host: "https://vika.your-company.com"   # 替换为您的服务器地址
+#   auto_sync_on_startup: true                   # 其他配置保持不变
+#   # ... 其他配置项
+
+# 简化配置（推荐新用户）
+# vika_mcp_plugin:
+#   vika_api_token: "ustk_your_api_token_here"   # 只需配置这一项！
+#   vika_host: "https://api.vika.cn"             # 其他都使用默认值，插件会自动发现数据表
