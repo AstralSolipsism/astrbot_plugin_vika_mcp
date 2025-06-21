@@ -1,14 +1,16 @@
-import asyncio
 import json
 import traceback
 import os
 import time
+import asyncio
 from typing import List, Dict, Any, Optional, Union
 from datetime import datetime, timedelta
 
-from astrbot.api.event import filter, AstrMessageEvent
+from astrbot.core.platform.astr_message_event import AstrMessageEvent
+from astrbot.api.event import filter
 from astrbot.api.star import Context, Star, register
 from astrbot.api import logger, AstrBotConfig
+
 
 try:
     from astral_vika import Vika
@@ -24,6 +26,7 @@ class VikaMcpPlugin(Star):
         self.config = config
         self.vika_client = None
         self.plugin_config = {}
+        self.sync_lock = asyncio.Lock()
         
         # 智能数据表管理
         self.datasheet_mapping = {}  # 自动发现的数据表映射 {name: id}
@@ -46,7 +49,7 @@ class VikaMcpPlugin(Star):
         """加载插件配置"""
         try:
             plugin_name = "vika_mcp_plugin"
-            self.plugin_config = self.config.get_plugin_config(plugin_name) or {}
+            self.plugin_config = self.config or {}
             self.default_space_id = self.plugin_config.get('default_space_id', '')
             logger.info(f"维格表MCP插件配置加载完成: {list(self.plugin_config.keys())}")
         except Exception as e:
@@ -68,7 +71,7 @@ class VikaMcpPlugin(Star):
             
         try:
             # 初始化客户端，支持自定义host
-            self.vika_client = Vika(api_token, host=vika_host)
+            self.vika_client = Vika(api_token, api_base=vika_host)
             logger.info(f"维格表客户端初始化成功，服务器: {vika_host}")
         except Exception as e:
             logger.error(f"维格表客户端初始化失败: {e}")
@@ -111,28 +114,26 @@ class VikaMcpPlugin(Star):
         except Exception as e:
             logger.error(f"保存缓存失败: {e}")
 
-    async def _run_sync_in_thread(self, func, *args, **kwargs):
-        """在线程池中异步执行同步函数"""
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(None, func, *args, **kwargs)
-
     def _get_datasheet_id(self, datasheet_name: str) -> str:
         """智能获取数据表ID"""
         # 1. 首先检查自动发现的映射
         if datasheet_name in self.datasheet_mapping:
-            return self.datasheet_mapping[datasheet_name]
+            datasheet_id = self.datasheet_mapping[datasheet_name]
+            return datasheet_id
             
         # 2. 检查自定义别名
         custom_aliases = self.plugin_config.get('custom_aliases', {})
         if datasheet_name in custom_aliases:
             real_name = custom_aliases[datasheet_name]
             if real_name in self.datasheet_mapping:
-                return self.datasheet_mapping[real_name]
+                datasheet_id = self.datasheet_mapping[real_name]
+                return datasheet_id
                 
         # 3. 检查手动配置的映射（向后兼容）
         manual_mapping = self.plugin_config.get('datasheet_mapping', {})
         if datasheet_name in manual_mapping:
-            return manual_mapping[datasheet_name]
+            datasheet_id = manual_mapping[datasheet_name]
+            return datasheet_id
             
         # 4. 如果是直接的datasheet ID格式，直接返回
         if datasheet_name.startswith('dst'):
@@ -144,6 +145,7 @@ class VikaMcpPlugin(Star):
                 return ds_id
                 
         # 6. 都找不到，返回原名称
+        logger.warning(f"未能通过任何已知方式解析数据表名称 '{datasheet_name}'。将按原样使用。")
         return datasheet_name
 
     def _get_datasheet(self, datasheet_name: str):
@@ -157,36 +159,42 @@ class VikaMcpPlugin(Star):
         
         return self.vika_client.datasheet(datasheet_id)
         
-    async def _traverse_node_recursive(self, node_id: str, datasheet_map: Dict[str, str], depth: int = 0):
+    async def _traverse_node_recursive(self, node_id: str, datasheet_map: Dict[str, str], depth: int = 0, space_id: str = None):
         """递归遍历节点，发现所有数据表"""
         if depth > 10:  # 防止无限递归
             logger.warning(f"递归深度超过限制，停止遍历节点: {node_id}")
             return
             
         try:
-            node_detail = await self._run_sync_in_thread(
-                lambda: self.vika_client.nodes.get(node_id)
-            )
+            node_detail = await self.vika_client.space(space_id).nodes.aget(node_id)
             
             if hasattr(node_detail, 'type'):
                 if node_detail.type == 'Datasheet':
                     datasheet_map[node_detail.name] = node_detail.id
                     logger.info(f"发现数据表: {node_detail.name} ({node_detail.id})")
-                elif node_detail.type == 'Folder' and hasattr(node_detail, 'children'):
-                    for child in node_detail.children:
-                        await self._traverse_node_recursive(child.get('id'), datasheet_map, depth + 1)
+                elif node_detail.type == 'Folder':
+                    # 对于文件夹节点，需要显式地通过API获取其子节点
+                    children_nodes = node_detail.children
+                    
+                    child_datasheets = [child.name for child in children_nodes if child.type == 'Datasheet']
+                    if child_datasheets:
+                        logger.info(f"在文件夹 [{node_detail.name}] 下发现维格表: {child_datasheets}")
+        
+                    for child in children_nodes:
+                        await self._traverse_node_recursive(child.id, datasheet_map, depth + 1, space_id) # 传递 space_id
         except Exception as e:
             logger.error(f"遍历节点 {node_id} 时出错: {e}")
 
     async def _auto_sync_if_needed(self):
         """如果需要且配置允许，自动同步数据表"""
-        if (not self.is_synced and 
-            self.plugin_config.get('auto_sync_on_startup', True) and 
+        if (not self.is_synced and
+            self.plugin_config.get('auto_sync_on_startup', True) and
             self.vika_client):
-            try:
+            async with self.sync_lock:
+                if self.is_synced:  # 在锁内进行双重检查
+                    return
+                # 现在让调用者处理异常
                 await self._perform_sync()
-            except Exception as e:
-                logger.error(f"自动同步失败: {e}")
 
     async def _perform_sync(self):
         """执行数据表同步"""
@@ -194,35 +202,37 @@ class VikaMcpPlugin(Star):
             raise ValueError("维格表客户端未初始化")
             
         # 获取空间站列表
-        spaces = await self._run_sync_in_thread(
-            lambda: list(self.vika_client.spaces.all())
-        )
+        spaces = await self.vika_client.spaces.alist()
         
         if not spaces:
             raise ValueError("未找到任何空间站，请检查API Token权限")
             
-        self.spaces_list = [{'id': space.id, 'name': space.name} for space in spaces]
+        self.spaces_list = [{'id': space['id'], 'name': space['name']} for space in spaces]
         
         # 确定要同步的空间站
         target_space = None
         if self.default_space_id:
-            target_space = next((s for s in spaces if s.id == self.default_space_id), None)
+            target_space = next((s for s in spaces if s['id'] == self.default_space_id), None)
         
         if not target_space:
             target_space = spaces[0]  # 使用第一个空间站
             
-        logger.info(f"同步空间站: {target_space.name} ({target_space.id})")
+        logger.info(f"开始同步空间站: {target_space['name']} (ID: {target_space['id']})")
         
-        # 获取根节点并递归遍历
-        root_nodes = await self._run_sync_in_thread(
-            lambda: list(self.vika_client.space(target_space.id).nodes.all())
-        )
+        # 使用 v2 API 直接搜索所有数据表节点，优化同步效率
+        logger.info(f"使用 API v2 高效同步空间站 [{target_space['name']}] 中的所有数据表...")
+        all_datasheet_nodes = await self.vika_client.space(target_space['id']).nodes.asearch(node_type='Datasheet')
         
-        new_datasheet_map = {}
-        for node in root_nodes:
-            await self._traverse_node_recursive(node.id, new_datasheet_map)
+        new_datasheet_map = {node.name: node.id for node in all_datasheet_nodes}
             
+        logger.info(f"同步完成。发现的维格表映射: {new_datasheet_map}")
         self.datasheet_mapping.update(new_datasheet_map)
+        
+        # 记录同步信息
+        if new_datasheet_map:
+            synced_table_names = list(new_datasheet_map.keys())
+            logger.info(f"成功同步 {len(synced_table_names)} 个维格表: {synced_table_names}")
+            
         self.is_synced = True
         self.cache_timestamp = time.time()
         
@@ -249,8 +259,9 @@ class VikaMcpPlugin(Star):
             # 获取所有字段名
             all_fields = set()
             for record in display_records:
-                if 'fields' in record:
-                    all_fields.update(record['fields'].keys())
+                record_fields = getattr(record, 'fields', None)
+                if record_fields:
+                    all_fields.update(record_fields.keys())
             
             field_list = list(all_fields)
             
@@ -260,7 +271,7 @@ class VikaMcpPlugin(Star):
             
             # 数据行
             for record in display_records:
-                fields = record.get('fields', {})
+                fields = getattr(record, 'fields', {})
                 row_data = []
                 for field in field_list:
                     value = fields.get(field, '')
@@ -280,7 +291,8 @@ class VikaMcpPlugin(Star):
         """解析字段数据字符串为字典"""
         try:
             # 尝试解析JSON格式
-            return json.loads(field_data_str)
+            data = json.loads(field_data_str)
+            return data
         except json.JSONDecodeError:
             # 如果不是JSON，尝试解析键值对格式
             fields = {}
@@ -295,18 +307,13 @@ class VikaMcpPlugin(Star):
                     if self.plugin_config.get('enable_auto_type_conversion', True):
                         if value.isdigit():
                             value = int(value)
-                        elif value.replace('.', '').isdigit():
+                        elif value.replace('.', '', 1).isdigit():
                             value = float(value)
                         elif value.lower() in ['true', 'false']:
                             value = value.lower() == 'true'
                     
                     fields[key] = value
             return fields
-
-    @filter.on_llm_request()
-    async def on_startup_sync(self, event):
-        """插件启动时自动同步"""
-        await self._auto_sync_if_needed()
 
     @filter.llm_tool(name="sync_vika_datasheets")
     async def sync_vika_datasheets(self, event: AstrMessageEvent) -> str:
@@ -338,15 +345,13 @@ class VikaMcpPlugin(Star):
 
     @filter.llm_tool(name="list_vika_spaces")
     async def list_vika_spaces(self, event: AstrMessageEvent) -> str:
-        """列出您有权访问的所有维格表空间站。
+        """列出您在维格表平台中创建或有权访问的所有空间站（即表格的组织容器）。
         """
         if not self.vika_client:
             return "❌ 错误：维格表客户端未初始化，请检查API Token配置"
             
         try:
-            spaces = await self._run_sync_in_thread(
-                lambda: list(self.vika_client.spaces.all())
-            )
+            spaces = await self.vika_client.spaces.alist()
             
             if not spaces:
                 return "📭 未找到任何空间站，请检查您的API Token权限"
@@ -354,9 +359,9 @@ class VikaMcpPlugin(Star):
             result = f"🏢 **您的维格表空间站** (共 {len(spaces)} 个)：\n\n"
             
             for space in spaces:
-                is_default = " 🔸 *默认*" if space.id == self.default_space_id else ""
-                result += f"• **{space.name}**{is_default}\n"
-                result += f"  ID: `{space.id}`\n\n"
+                is_default = " 🔸 *默认*" if space['id'] == self.default_space_id else ""
+                result += f"• **{space['name']}**{is_default}\n"
+                result += f"  ID: `{space['id']}`\n\n"
                 
             if not self.default_space_id and len(spaces) > 1:
                 result += "💡 **提示**: 如果您有多个空间站，建议在配置中设置 `default_space_id` 以指定默认操作的空间站。"
@@ -369,119 +374,137 @@ class VikaMcpPlugin(Star):
             return error_msg
 
     @filter.llm_tool(name="list_vika_datasheets")
-    async def list_vika_datasheets(self, event: AstrMessageEvent, filter_keyword: str = None) -> str:
-        """列出所有已发现的维格表数据表，支持关键词过滤。
+    async def list_vika_datasheets(self, event: AstrMessageEvent, space_id: str = None, filter_keyword: str = None, recursive_search: bool = False) -> str:
+        """列出维格表中的所有具体数据表格（Datasheet），支持指定空间站和关键词过滤。
 
         Args:
-            filter_keyword (str): 可选，过滤关键词，只显示包含该关键词的数据表
+            space_id(string): 可选，指定要列出数据表的空间站ID。如果未提供，将使用默认空间站或已同步的数据表。
+            filter_keyword(string): 可选，过滤关键词，只显示包含该关键词的数据表。
+            recursive_search(boolean): 可选，默认为False。如果为True，将使用递归方式遍历文件夹来查找数据表，可以发现文件夹信息但速度较慢；如果为False，将使用高效的搜索API，速度快但无法展示文件夹层级。
         """
-        if not self.is_synced:
-            return "⚠️ 数据表列表尚未同步，请先运行数据表同步功能，或者稍等片刻让系统自动同步。"
+        if not self.vika_client:
+            return "❌ 错误：维格表客户端未初始化，请检查API Token配置"
+
+        try:
+            datasheets_to_list = {}
+            space_id_to_query = space_id
             
-        if not self.datasheet_mapping:
-            return "📭 未发现任何数据表，请检查空间站中是否有数据表，或重新同步。"
+            # 如果用户没有提供 space_id，则检查并使用默认配置
+            if not space_id_to_query:
+                space_id_to_query = self.default_space_id
+
+            if space_id_to_query and isinstance(space_id_to_query, str):
+                try:
+                    if recursive_search:
+                        # 如果启用了递归搜索，则使用旧的遍历方法
+                        logger.info(f"使用递归方式遍历空间站 [{space_id_to_query}]...")
+                        root_nodes = await self.vika_client.space(space_id_to_query).nodes.alist()
+                        temp_map = {}
+                        for node in root_nodes:
+                            await self._traverse_node_recursive(node.id, temp_map, space_id=space_id_to_query)
+                        datasheets_to_list = temp_map
+                    else:
+                        # 默认使用高效的v2搜索API
+                        logger.info(f"使用 API v2 搜索空间站 [{space_id_to_query}] 中的所有数据表...")
+                        all_datasheet_nodes = await self.vika_client.space(space_id_to_query).nodes.asearch(node_type='Datasheet')
+                        datasheets_to_list = {node.name: node.id for node in all_datasheet_nodes}
+                except Exception as e:
+                    logger.error(f"无法获取空间站 '{space_id_to_query}' 中的数据表: {e}\n{traceback.format_exc()}")
+                    return f"❌ 无法获取空间站 '{space_id_to_query}' 中的数据表，请检查空间站ID和权限: {str(e)}"
+            else:
+                # 如果没有指定space_id，则使用已同步的数据表
+                await self._auto_sync_if_needed()
+                if not self.is_synced:
+                    return "⚠️ 数据表列表尚未同步，请先运行数据表同步功能。"
+                datasheets_to_list = self.datasheet_mapping
+
+            if not datasheets_to_list:
+                return "📭 未发现任何数据表，请检查空间站中是否有数据表，或重新同步。"
+
+            # 应用过滤
+            filtered_tables = {}
+            if filter_keyword:
+                for name, ds_id in datasheets_to_list.items():
+                    if filter_keyword.lower() in name.lower():
+                        filtered_tables[name] = ds_id
+            else:
+                filtered_tables = datasheets_to_list
+
+            if not filtered_tables:
+                return f"🔍 未找到包含关键词 '{filter_keyword}' 的数据表。"
+
+            result = f"📊 **数据表列表**"
+            if space_id_to_query:
+                result += f" (来自空间站: `{space_id_to_query}`)"
+            if filter_keyword:
+                result += f" (包含 '{filter_keyword}')"
+            result += f" (共 {len(filtered_tables)} 个)：\n\n"
+
+            for name, ds_id in filtered_tables.items():
+                result += f"• **{name}**\n"
+                result += f"  ID: `{ds_id}`\n\n"
+
+            # 显示自定义别名提示
+            custom_aliases = self.plugin_config.get('custom_aliases', {})
+            if custom_aliases:
+                result += "🏷️ **自定义别名**：\n"
+                for alias, real_name in custom_aliases.items():
+                    if real_name in self.datasheet_mapping: # 仅显示已同步的别名
+                        result += f"• `{alias}` → {real_name}\n"
+                result += "\n"
+
+            result += "💡 **提示**: 您可以直接使用数据表名称进行操作，系统会自动识别。"
             
-        # 应用过滤
-        filtered_tables = self.datasheet_mapping
-        if filter_keyword:
-            filtered_tables = {
-                name: ds_id for name, ds_id in self.datasheet_mapping.items()
-                if filter_keyword.lower() in name.lower()
-            }
-            
-        if not filtered_tables:
-            return f"🔍 未找到包含关键词 '{filter_keyword}' 的数据表。"
-            
-        result = f"📊 **数据表列表**"
-        if filter_keyword:
-            result += f" (包含 '{filter_keyword}')"
-        result += f" (共 {len(filtered_tables)} 个)：\n\n"
-        
-        for name, ds_id in filtered_tables.items():
-            result += f"• **{name}**\n"
-            result += f"  ID: `{ds_id}`\n\n"
-            
-        # 显示自定义别名提示
-        custom_aliases = self.plugin_config.get('custom_aliases', {})
-        if custom_aliases:
-            result += "🏷️ **自定义别名**：\n"
-            for alias, real_name in custom_aliases.items():
-                if real_name in self.datasheet_mapping:
-                    result += f"• `{alias}` → {real_name}\n"
-            result += "\n"
-            
-        result += "💡 **提示**: 您可以直接使用数据表名称进行操作，系统会自动识别。"
-        
-        return result
+            return result
+
+        except Exception as e:
+            error_msg = f"❌ 查询表格失败：{str(e)}。请检查您的API Token权限或空间站ID是否正确，并查看后台日志获取详细错误信息。"
+            logger.error(f"获取数据表列表失败: {e}\n{traceback.format_exc()}")
+            return error_msg
 
     @filter.llm_tool(name="create_vika_datasheet")
-    async def create_vika_datasheet(
-        self, 
-        event: AstrMessageEvent, 
-        name: str, 
-        description: str = "",
-        fields_config: str = ""
-    ) -> str:
+    async def create_vika_datasheet(self, event: AstrMessageEvent, datasheet_name: str, fields: list) -> str:
         """在维格表空间站中创建一个新的数据表。
 
         Args:
-            name (str): 数据表名称（必需）
-            description (str): 数据表描述（可选）
-            fields_config (str): 字段配置，JSON格式，例如：'[{"name":"姓名","type":"SingleLineText"},{"name":"年龄","type":"Number"}]'
+            datasheet_name(string): 要创建的数据表的名称。
+            fields(array): 字段列表，每个字段是一个包含 "name" 和 "type" 的字典。
         """
         if not self.vika_client:
             return "❌ 错误：维格表客户端未初始化，请检查API Token配置"
             
         try:
             # 确定目标空间站
-            spaces = await self._run_sync_in_thread(
-                lambda: list(self.vika_client.spaces.all())
-            )
+            spaces = await self.vika_client.spaces.alist()
             
             if not spaces:
                 return "❌ 未找到任何空间站，请检查API Token权限"
                 
             target_space = None
             if self.default_space_id:
-                target_space = next((s for s in spaces if s.id == self.default_space_id), None)
+                target_space = next((s for s in spaces if s['id'] == self.default_space_id), None)
             
             if not target_space:
                 target_space = spaces[0]
                 
-            # 解析字段配置
-            fields = []
-            if fields_config:
-                try:
-                    fields = json.loads(fields_config)
-                except json.JSONDecodeError:
-                    return "❌ 字段配置格式错误，请使用正确的JSON格式"
-                    
             # 创建数据表
             create_params = {
-                'name': name,
-                'description': description,
-                'folderId': target_space.id
+                'name': datasheet_name,
+                'fields': fields,
+                'folderId': target_space['id']
             }
             
-            if fields:
-                create_params['fields'] = fields
-                
-            new_datasheet = await self._run_sync_in_thread(
-                lambda: self.vika_client.space(target_space.id).datasheets.create(**create_params)
-            )
+            new_datasheet = await self.vika_client.space(target_space['id']).datasheets.acreate(**create_params)
             
             # 更新本地缓存
-            self.datasheet_mapping[name] = new_datasheet.id
+            self.datasheet_mapping[datasheet_name] = new_datasheet.id
             self._save_cache()
             
             result = f"✅ 数据表创建成功！\n\n"
-            result += f"📊 **数据表名称**: {name}\n"
+            result += f"📊 **数据表名称**: {datasheet_name}\n"
             result += f"🆔 **数据表ID**: `{new_datasheet.id}`\n"
-            result += f"🏢 **所在空间站**: {target_space.name}\n"
+            result += f"🏢 **所在空间站**: {target_space['name']}\n"
             
-            if description:
-                result += f"📝 **描述**: {description}\n"
-                
             if fields:
                 result += f"📋 **字段数量**: {len(fields)} 个\n"
                 
@@ -498,6 +521,9 @@ class VikaMcpPlugin(Star):
         """检查数据表是否同步，如果未找到则提供建议"""
         if not self.vika_client:
             return "❌ 维格表客户端未初始化，请检查API Token配置"
+
+        # 确保在检查前已尝试同步
+        await self._auto_sync_if_needed()
             
         # 尝试智能获取数据表ID
         datasheet_id = self._get_datasheet_id(datasheet_name)
@@ -505,7 +531,8 @@ class VikaMcpPlugin(Star):
         # 如果没有找到匹配的数据表，提供建议
         if datasheet_id == datasheet_name and not datasheet_name.startswith('dst'):
             if not self.is_synced:
-                return f"⚠️ 未找到数据表 '{datasheet_name}'，且数据表列表尚未同步。请先运行数据表同步功能。"
+                msg = f"⚠️ 未找到数据表 '{datasheet_name}'，且数据表列表自动同步失败。请检查配置或手动同步。"
+                return msg
             else:
                 # 提供相似的数据表建议
                 similar_tables = []
@@ -520,29 +547,40 @@ class VikaMcpPlugin(Star):
                     return suggestion
                 else:
                     available_tables = list(self.datasheet_mapping.keys())[:5]
-                    return (f"❌ 未找到数据表 '{datasheet_name}'。\n"
+                    msg = (f"❌ 未找到数据表 '{datasheet_name}'。\n"
                            f"可用的数据表：{', '.join(available_tables)}")
+                    return msg
         
         return None  # 找到了数据表，无需提示
 
-    @filter.llm_tool(name="get_vika_records")
-    async def get_vika_records(
-        self, 
-        event: AstrMessageEvent, 
-        datasheet_name: str, 
-        view_name: str = None,
-        filter_formula: str = None,
-        max_records: int = None
-    ) -> str:
-        """从指定的维格表中获取记录数据。
+    @filter.llm_tool(name="query_vika_datasheet")
+    async def query_vika_datasheet(self, event: AstrMessageEvent, datasheet_name: str, formula: str = None, fields: list = None, max_records: int = 0):
+        """查询并返回指定维格表中的记录，支持按公式、字段进行过滤。
 
         Args:
-            datasheet_name (str): 要查询的数据表名称或别名（必需）
-            view_name (str): 可选，指定视图名称
-            filter_formula (str): 可选，过滤公式，用于筛选记录
-            max_records (int): 可选，最大返回记录数，默认为配置中的值
+            datasheet_name(string): 要查询的数据表的名称。
+            formula(string): 用于筛选记录的公式。
+            fields(array): 需要返回的字段名称列表。
+            max_records(number): 要返回的最大记录数。
+
+        **公式示例**:
+        - **精确匹配文本**: `"{状态} = '已完成'"`
+        - **模糊匹配文本**: `FIND('任务', {标题})`
+        - **数字比较**: `"{分数} > 90"`
+        - **日期比较**:
+          - **查询今天**: `IS_SAME({日期}, TODAY(), 'day')`
+          - **查询明天**: `IS_SAME({日期}, DATE_ADD(TODAY(), 1, 'days'), 'day')`
+          - **查询特定日期**: `IS_SAME({日期}, '2023-10-01', 'day')`
+        - **逻辑组合**: `AND({分数} > 60, {状态} = '进行中')`
         """
         try:
+            # 检查并转换 max_records 参数
+            if isinstance(max_records, str):
+                try:
+                    max_records = int(max_records)
+                except (ValueError, TypeError):
+                    return "❌ 参数错误: max_records 必须是一个有效的数字。"
+
             # 检查同步状态并提供建议
             sync_check = await self._check_sync_and_suggest(datasheet_name)
             if sync_check:
@@ -552,24 +590,17 @@ class VikaMcpPlugin(Star):
             
             # 准备查询参数
             query_params = {}
-            if view_name:
-                query_params['view'] = view_name
-            if filter_formula:
-                query_params['filterByFormula'] = filter_formula
-            if max_records:
-                query_params['maxRecords'] = min(max_records, 100)  # API限制
+            if formula:
+                query_params['formula'] = formula
+            if fields:
+                query_params['fields'] = fields
+            if max_records > 0: # 只有当 max_records 大于 0 时才设置
+                query_params['maxRecords'] = min(max_records, 1000)
             
-            # 在线程池中执行同步操作
-            if query_params:
-                records = await self._run_sync_in_thread(
-                    lambda: list(datasheet.records.filter(**query_params))
-                )
-            else:
-                records = await self._run_sync_in_thread(
-                    lambda: list(datasheet.records.all())
-                )
+            # 直接执行异步操作
+            records_list = await datasheet.records.filter(**query_params).all()
             
-            return self._format_records_for_display(records, max_records)
+            return self._format_records_for_display(records_list, max_records if max_records > 0 else None)
             
         except Exception as e:
             error_msg = f"❌ 获取维格表记录失败: {str(e)}"
@@ -578,16 +609,15 @@ class VikaMcpPlugin(Star):
 
     @filter.llm_tool(name="add_vika_record")
     async def add_vika_record(
-        self, 
-        event: AstrMessageEvent, 
-        datasheet_name: str, 
+        self,
+        datasheet_name: str,
         record_data: str
     ) -> str:
         """向指定的维格表中添加新记录。
 
         Args:
-            datasheet_name (str): 要添加记录的数据表名称或别名（必需）
-            record_data (str): 记录数据，可以是JSON格式或键值对格式（如："姓名=张三,年龄=25"或'{"姓名":"张三","年龄":25}'）
+            datasheet_name(string): 要添加记录的数据表名称或别名（必需）
+            record_data(string): 记录数据，可以是JSON格式或键值对格式（如："姓名=张三,年龄=25"或'{"姓名":"张三","年龄":25}'）
         """
         try:
             # 检查同步状态并提供建议
@@ -603,12 +633,11 @@ class VikaMcpPlugin(Star):
             if not fields_data:
                 return "❌ 错误：记录数据为空或格式不正确。请使用JSON格式或键值对格式（如：'姓名=张三,年龄=25'）"
             
-            # 在线程池中执行同步操作
-            result = await self._run_sync_in_thread(
-                lambda: datasheet.records.create(fields_data)
-            )
+            # 直接执行异步操作
+            result = await datasheet.records.acreate(fields_data)
             
-            return f"✅ 成功添加记录到数据表 '{datasheet_name}'，记录ID: {result.record_id}"
+            logger.info(f"成功向维格表 [{datasheet_name}] 添加了 1 条新记录: {result.id}")
+            return f"✅ 成功添加记录到数据表 '{datasheet_name}'，记录ID: {result.id}"
             
         except Exception as e:
             error_msg = f"❌ 添加维格表记录失败: {str(e)}"
@@ -617,18 +646,17 @@ class VikaMcpPlugin(Star):
 
     @filter.llm_tool(name="search_vika_records")
     async def search_vika_records(
-        self, 
-        event: AstrMessageEvent, 
-        datasheet_name: str, 
+        self,
+        datasheet_name: str,
         search_query: str,
         search_fields: str = None
     ) -> str:
         """在指定的维格表中搜索包含特定内容的记录。
 
         Args:
-            datasheet_name (str): 要搜索的数据表名称或别名（必需）
-            search_query (str): 搜索关键词（必需）
-            search_fields (str): 可选，指定要搜索的字段名，多个字段用逗号分隔
+            datasheet_name(string): 要搜索的数据表名称或别名（必需）
+            search_query(string): 搜索关键词（必需）
+            search_fields(string): 可选，指定要搜索的字段名，多个字段用逗号分隔
         """
         try:
             # 检查同步状态并提供建议
@@ -639,9 +667,7 @@ class VikaMcpPlugin(Star):
             datasheet = self._get_datasheet(datasheet_name)
             
             # 获取所有记录
-            all_records = await self._run_sync_in_thread(
-                lambda: list(datasheet.records.all())
-            )
+            all_records = await datasheet.records.aall()
             
             # 执行搜索
             matching_records = []
@@ -652,7 +678,7 @@ class VikaMcpPlugin(Star):
                 search_field_list = [f.strip() for f in search_fields.split(',')]
             
             for record in all_records:
-                fields = record.get('fields', {})
+                fields = getattr(record, 'fields', {})
                 
                 # 确定要搜索的字段
                 fields_to_search = search_field_list if search_field_list else fields.keys()
@@ -682,19 +708,13 @@ class VikaMcpPlugin(Star):
             return error_msg
 
     @filter.llm_tool(name="update_vika_record")
-    async def update_vika_record(
-        self, 
-        event: AstrMessageEvent, 
-        datasheet_name: str, 
-        record_id: str,
-        update_data: str
-    ) -> str:
+    async def update_vika_record(self, event: AstrMessageEvent, datasheet_name: str, record_id: str, record_data: dict) -> str:
         """更新指定维格表中的记录。
 
         Args:
-            datasheet_name (str): 数据表名称或别名（必需）
-            record_id (str): 要更新的记录ID（必需）
-            update_data (str): 更新数据，格式同添加记录
+            datasheet_name(string): 记录所在的数据表的名称。
+            record_id(string): 要更新的记录的 ID。
+            record_data(object): 一个包含要更新的字段和新值的字典。
         """
         try:
             # 检查同步状态并提供建议
@@ -704,17 +724,14 @@ class VikaMcpPlugin(Star):
                 
             datasheet = self._get_datasheet(datasheet_name)
             
-            # 解析更新数据
-            fields_data = self._parse_field_data(update_data)
-            
-            if not fields_data:
+            if not record_data:
                 return "❌ 错误：更新数据为空或格式不正确"
             
-            # 在线程池中执行同步操作
-            await self._run_sync_in_thread(
-                lambda: datasheet.records.update(record_id, fields_data)
-            )
+            # 直接执行异步操作
+            # aupdate 期望一个包含 recordId 的字典或 Record 对象
+            await datasheet.records.aupdate([{'recordId': record_id, 'fields': record_data}])
             
+            logger.info(f"成功在维格表 [{datasheet_name}] 中更新了 1 条记录: {record_id}")
             return f"✅ 成功更新数据表 '{datasheet_name}' 中的记录 {record_id}"
             
         except Exception as e:
@@ -723,17 +740,12 @@ class VikaMcpPlugin(Star):
             return error_msg
 
     @filter.llm_tool(name="delete_vika_record")
-    async def delete_vika_record(
-        self, 
-        event: AstrMessageEvent, 
-        datasheet_name: str, 
-        record_id: str
-    ) -> str:
+    async def delete_vika_record(self, event: AstrMessageEvent, datasheet_name: str, record_id: str) -> str:
         """删除指定维格表中的记录。
 
         Args:
-            datasheet_name (str): 数据表名称或别名（必需）
-            record_id (str): 要删除的记录ID（必需）
+            datasheet_name(string): 记录所在的数据表的名称。
+            record_id(string): 要删除的记录的 ID。
         """
         try:
             # 检查同步状态并提供建议
@@ -743,10 +755,8 @@ class VikaMcpPlugin(Star):
                 
             datasheet = self._get_datasheet(datasheet_name)
             
-            # 在线程池中执行同步操作
-            await self._run_sync_in_thread(
-                lambda: datasheet.records.delete(record_id)
-            )
+            # 直接执行异步操作
+            await datasheet.records.adelete(record_id)
             
             return f"✅ 成功删除数据表 '{datasheet_name}' 中的记录 {record_id}"
             
@@ -757,14 +767,13 @@ class VikaMcpPlugin(Star):
 
     @filter.llm_tool(name="get_vika_fields")
     async def get_vika_fields(
-        self, 
-        event: AstrMessageEvent, 
+        self,
         datasheet_name: str
     ) -> str:
         """获取指定维格表的字段信息。
 
         Args:
-            datasheet_name (str): 数据表名称或别名（必需）
+            datasheet_name(string): 数据表名称或别名（必需）
         """
         try:
             # 检查同步状态并提供建议
@@ -775,22 +784,16 @@ class VikaMcpPlugin(Star):
             datasheet = self._get_datasheet(datasheet_name)
             
             # 获取字段信息
-            fields = await self._run_sync_in_thread(
-                lambda: list(datasheet.fields.all())
-            )
+            fields = await datasheet.fields.aall()
             
             if not fields:
                 return f"📋 数据表 '{datasheet_name}' 没有字段信息"
             
             result = f"📋 **数据表 '{datasheet_name}' 的字段信息** (共 {len(fields)} 个字段):\n\n"
             for field in fields:
-                field_name = field.get('name', '未知')
-                field_type = field.get('type', '未知')
-                field_desc = field.get('description', '')
-                
-                result += f"• **{field_name}** (类型: {field_type})"
-                if field_desc:
-                    result += f" - {field_desc}"
+                result += f"• **{field.name}** (类型: {field.type})"
+                if hasattr(field, 'description') and field.description:
+                    result += f" - {field.description}"
                 result += "\n"
             
             result += "\n💡 您可以使用这些字段名来添加或更新记录。"
@@ -802,10 +805,13 @@ class VikaMcpPlugin(Star):
             return error_msg
 
     @filter.llm_tool(name="get_vika_status")
-    async def get_vika_status(self, event: AstrMessageEvent) -> str:
+    async def get_vika_status(self) -> str:
         """检查维格表插件的连接状态、配置信息和数据表同步状态。
         """
         try:
+            # 确保状态检查前已尝试同步
+            await self._auto_sync_if_needed()
+            
             status = "🔧 **维格表MCP插件状态**\n\n"
             
             # 检查客户端状态
@@ -882,8 +888,8 @@ class VikaMcpPlugin(Star):
     async def initialize(self):
         """插件初始化"""
         logger.info("维格表MCP插件初始化完成")
-        # 启动时自动同步
-        await self._auto_sync_if_needed()
+        # 启动时不再自动同步，改为按需同步
+        # asyncio.create_task(self._auto_sync_if_needed())
 
     async def terminate(self):
         """插件销毁"""

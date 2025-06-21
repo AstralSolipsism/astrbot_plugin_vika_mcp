@@ -1,4 +1,4 @@
-# AstrBot 维格表MCP插件 v3.0
+# AstrBot 维格表MCP插件 v0.9
 
 一个基于MCP（Model-Controller-Plugin）架构的**智能化**维格表集成插件，支持**自动发现数据表**，大模型通过自然语言自动调用维格表操作功能，真正的零配置使用体验。
 

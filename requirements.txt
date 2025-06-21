@@ -1,2 +1,2 @@
-astral_vika==0.9.2
+-e G:\开发相关\astral_vika
 aiohttp
