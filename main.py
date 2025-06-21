@@ -220,8 +220,8 @@ class VikaMcpPlugin(Star):
         logger.info(f"开始同步空间站: {target_space['name']} (ID: {target_space['id']})")
         
         # 使用 v2 API 直接搜索所有数据表节点，优化同步效率
-        logger.info(f"使用 API v2 高效同步空间站 [{target_space['name']}] 中的所有数据表...")
-        all_datasheet_nodes = await self.vika_client.space(target_space['id']).nodes.asearch(node_type='Datasheet')
+        logger.info(f"高效同步空间站 [{target_space['name']}] 中的所有数据表...")
+        all_datasheet_nodes = await self.vika_client.space(target_space['id']).nodes.asearch(type='Datasheet')
         
         new_datasheet_map = {node.name: node.id for node in all_datasheet_nodes}
             
@@ -240,6 +240,22 @@ class VikaMcpPlugin(Star):
         self._save_cache()
         
         return len(new_datasheet_map)
+
+    def _format_records_to_json(self, records: List[Any]) -> str:
+        """将记录列表格式化为JSON字符串，以便AI理解。"""
+        if not records:
+            return json.dumps([])
+
+        record_list = []
+        for record in records:
+            # 假设 record 对象有 .id 和 .fields 属性
+            record_dict = {
+                "record_id": getattr(record, 'id', ''),
+                "fields": getattr(record, 'fields', {})
+            }
+            record_list.append(record_dict)
+        
+        return json.dumps(record_list, ensure_ascii=False, indent=2)
 
     def _format_records_for_display(self, records: List[Dict[str, Any]], limit: int = None) -> str:
         """格式化记录为可读的文本格式"""
@@ -404,9 +420,9 @@ class VikaMcpPlugin(Star):
                             await self._traverse_node_recursive(node.id, temp_map, space_id=space_id_to_query)
                         datasheets_to_list = temp_map
                     else:
-                        # 默认使用高效的v2搜索API
-                        logger.info(f"使用 API v2 搜索空间站 [{space_id_to_query}] 中的所有数据表...")
-                        all_datasheet_nodes = await self.vika_client.space(space_id_to_query).nodes.asearch(node_type='Datasheet')
+                        # 默认使用高效的搜索API
+                        logger.info(f"使用高效搜索API在空间站 [{space_id_to_query}] 中查找所有数据表...")
+                        all_datasheet_nodes = await self.vika_client.space(space_id_to_query).nodes.asearch(type='Datasheet')
                         datasheets_to_list = {node.name: node.id for node in all_datasheet_nodes}
                 except Exception as e:
                     logger.error(f"无法获取空间站 '{space_id_to_query}' 中的数据表: {e}\n{traceback.format_exc()}")
@@ -554,56 +570,45 @@ class VikaMcpPlugin(Star):
         return None  # 找到了数据表，无需提示
 
     @filter.llm_tool(name="query_vika_datasheet")
-    async def query_vika_datasheet(self, event: AstrMessageEvent, datasheet_name: str, formula: str = None, fields: list = None, max_records: int = 0):
-        """查询并返回指定维格表中的记录，支持按公式、字段进行过滤。
+    async def query_vika_datasheet(self, event: AstrMessageEvent, datasheet_name: str, formula: str = None):
+        """
+        查询并返回指定维格表中的内容。支持使用公式进行精确过滤。
 
         Args:
-            datasheet_name(string): 要查询的数据表的名称。
-            formula(string): 用于筛选记录的公式。
-            fields(array): 需要返回的字段名称列表。
-            max_records(number): 要返回的最大记录数。
-
-        **公式示例**:
-        - **精确匹配文本**: `"{状态} = '已完成'"`
-        - **模糊匹配文本**: `FIND('任务', {标题})`
-        - **数字比较**: `"{分数} > 90"`
-        - **日期比较**:
-          - **查询今天**: `IS_SAME({日期}, TODAY(), 'day')`
-          - **查询明天**: `IS_SAME({日期}, DATE_ADD(TODAY(), 1, 'days'), 'day')`
-          - **查询特定日期**: `IS_SAME({日期}, '2023-10-01', 'day')`
-        - **逻辑组合**: `AND({分数} > 60, {状态} = '进行中')`
+            datasheet_name(string): 要查询的数据表的准确名称。
+            formula(string): 可选，一个维格表查询公式，用于过滤记录。例如："AND({状态}='已完成', {负责人}='张三')"
         """
         try:
-            # 检查并转换 max_records 参数
-            if isinstance(max_records, str):
-                try:
-                    max_records = int(max_records)
-                except (ValueError, TypeError):
-                    return "❌ 参数错误: max_records 必须是一个有效的数字。"
+            if not self.vika_client:
+                return "❌ 错误：维格表客户端未初始化，请检查API Token配置"
 
             # 检查同步状态并提供建议
             sync_check = await self._check_sync_and_suggest(datasheet_name)
             if sync_check:
                 return sync_check
-                
+            
             datasheet = self._get_datasheet(datasheet_name)
-            
-            # 准备查询参数
-            query_params = {}
+            logger.info(f"成功定位数据表: {datasheet.dst_id}")
+
+            # 根据是否有公式来决定查询方式
             if formula:
-                query_params['formula'] = formula
-            if fields:
-                query_params['fields'] = fields
-            if max_records > 0: # 只有当 max_records 大于 0 时才设置
-                query_params['maxRecords'] = min(max_records, 1000)
+                logger.info(f"使用公式进行查询: {formula}")
+                # 使用公式过滤记录
+                records = await datasheet.records.filter(formula=formula).aall()
+            else:
+                logger.info("查询所有记录")
+                # 获取所有记录
+                records = await datasheet.records.aall()
+
+            # 格式化为JSON并返回
+            formatted_content = self._format_records_to_json(records)
             
-            # 直接执行异步操作
-            records_list = await datasheet.records.filter(**query_params).all()
+            logger.info(f"成功读取数据表 '{datasheet_name}' 的 {len(records)} 条记录。")
             
-            return self._format_records_for_display(records_list, max_records if max_records > 0 else None)
-            
+            return formatted_content
+
         except Exception as e:
-            error_msg = f"❌ 获取维格表记录失败: {str(e)}"
+            error_msg = f"❌ 查询维格表 '{datasheet_name}' 内容失败: {str(e)}"
             logger.error(f"{error_msg}\n{traceback.format_exc()}")
             return error_msg
 
@@ -882,6 +887,81 @@ class VikaMcpPlugin(Star):
             
         except Exception as e:
             error_msg = f"❌ 获取状态信息失败: {str(e)}"
+            logger.error(f"{error_msg}\n{traceback.format_exc()}")
+            return error_msg
+
+    @filter.llm_tool(name="upload_vika_attachment")
+    async def upload_vika_attachment(
+        self, 
+        event: AstrMessageEvent, 
+        datasheet_name: str, 
+        file_path: str,
+        record_id: str = None,
+        field_name: str = None
+    ) -> str:
+        """将本地文件作为附件上传到维格表，并可选择直接关联到指定记录的特定字段。
+
+        Args:
+            datasheet_name(string): 附件要上传到的数据表的名称。
+            file_path(string): 要上传的本地文件的完整路径。
+            record_id(string): 可选，要将附件添加到的记录的ID。
+            field_name(string): 可选，要添加附件的字段名称。如果提供了 record_id，此项为必需。
+        """
+        try:
+            if not self.vika_client:
+                return "❌ 错误：维格表客户端未初始化，请检查API Token配置"
+
+            if not os.path.exists(file_path):
+                return f"❌ 错误：文件未找到 '{file_path}'"
+
+            if record_id and not field_name:
+                return "❌ 错误：当提供 record_id 时，必须同时提供 field_name。"
+
+            # 检查同步状态并提供建议
+            sync_check = await self._check_sync_and_suggest(datasheet_name)
+            if sync_check:
+                return sync_check
+            
+            datasheet = self._get_datasheet(datasheet_name)
+            logger.info(f"准备向数据表 '{datasheet_name}' (ID: {datasheet.dst_id}) 上传文件: {file_path}")
+
+            # 步骤 1: 执行上传
+            attachment = await datasheet.attachments.aupload(file_path)
+            logger.info(f"文件上传成功: {attachment.name} (Token: {attachment.token})")
+
+            # 步骤 2: 如果提供了记录ID和字段名，则直接更新记录
+            if record_id and field_name:
+                logger.info(f"准备将附件关联到记录 '{record_id}' 的字段 '{field_name}'")
+                update_data = {
+                    'recordId': record_id,
+                    'fields': {
+                        field_name: [
+                            {'token': attachment.token}
+                        ]
+                    }
+                }
+                await datasheet.records.aupdate([update_data])
+                logger.info(f"成功将附件关联到记录 {record_id}")
+                return (
+                    f"✅ 文件上传并成功关联！\n\n"
+                    f"📄 **文件名**: {attachment.name}\n"
+                    f"📦 **大小**: {attachment.size / 1024:.2f} KB\n"
+                    f"🔗 **已关联到**: 数据表 '{datasheet_name}' -> 记录 '{record_id}' -> 字段 '{field_name}'"
+                )
+
+            # 如果没有提供记录ID，则只返回附件信息
+            result = (
+                f"✅ 文件上传成功！\n\n"
+                f"📄 **文件名**: {attachment.name}\n"
+                f"📦 **大小**: {attachment.size / 1024:.2f} KB\n"
+                f"🔗 **URL**: {attachment.url}\n"
+                f"🔑 **附件Token**: `{attachment.token}`\n\n"
+                f"💡 **提示**: 您可以在'添加记录'或'更新记录'时，在相应的附件字段中使用此附件Token。"
+            )
+            return result
+
+        except Exception as e:
+            error_msg = f"❌ 上传附件到 '{datasheet_name}' 失败: {str(e)}"
             logger.error(f"{error_msg}\n{traceback.format_exc()}")
             return error_msg
 
