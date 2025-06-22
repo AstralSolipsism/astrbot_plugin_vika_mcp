@@ -1,2 +1,2 @@
--e G:\开发相关\astral_vika
+astral_vika
 aiohttp

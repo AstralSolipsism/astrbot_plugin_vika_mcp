@@ -570,13 +570,14 @@ class VikaMcpPlugin(Star):
         return None  # 找到了数据表，无需提示
 
     @filter.llm_tool(name="query_vika_datasheet")
-    async def query_vika_datasheet(self, event: AstrMessageEvent, datasheet_name: str, formula: str = None):
+    async def query_vika_datasheet(self, event: AstrMessageEvent, datasheet_name: str, formula: str = None, view_id: str = None):
         """
-        查询并返回指定维格表中的内容。支持使用公式进行精确过滤。
+        查询并返回指定维格表中的内容。支持使用公式进行精确过滤或按视图查询。
 
         Args:
             datasheet_name(string): 要查询的数据表的准确名称。
             formula(string): 可选，一个维格表查询公式，用于过滤记录。例如："AND({状态}='已完成', {负责人}='张三')"
+            view_id(string): 可选，要查询的视图ID。如果未指定，则查询所有记录。
         """
         try:
             if not self.vika_client:
@@ -590,14 +591,20 @@ class VikaMcpPlugin(Star):
             datasheet = self._get_datasheet(datasheet_name)
             logger.info(f"成功定位数据表: {datasheet.dst_id}")
 
-            # 根据是否有公式来决定查询方式
+            # 构建查询参数
+            query_params = {}
             if formula:
+                query_params['formula'] = formula
                 logger.info(f"使用公式进行查询: {formula}")
-                # 使用公式过滤记录
-                records = await datasheet.records.filter(formula=formula).aall()
+            if view_id:
+                query_params['viewId'] = view_id
+                logger.info(f"按视图进行查询: {view_id}")
+
+            # 根据参数决定查询方式
+            if query_params:
+                records = await datasheet.records.filter(**query_params).aall()
             else:
                 logger.info("查询所有记录")
-                # 获取所有记录
                 records = await datasheet.records.aall()
 
             # 格式化为JSON并返回
